@@ -28,6 +28,7 @@ from lerobot.configs.accelerator import (
     FSDPConfig,
     GradientAccumulationConfig,
     GradScalerConfig,
+    ProfilerConfig,
 )
 from lerobot.configs.parallelism import ParallelismConfig
 
@@ -51,6 +52,14 @@ class TestFieldValidation:
 
     @pytest.mark.parametrize(
         ("field", "value"),
+        [("wait", -1), ("warmup", -1), ("active", 0), ("repeat", -1)],
+    )
+    def test_profiler_schedule_lengths(self, field, value):
+        with pytest.raises(ValueError, match=f"profiler.{field}"):
+            ProfilerConfig(**{field: value})
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
         [
             ("init_scale", 0.0),
             ("growth_factor", 1.0),  # a scale that can never recover after a backoff
@@ -71,6 +80,7 @@ class TestDraccusRoundTrip:
             AcceleratorConfig(),
             AcceleratorConfig(
                 mixed_precision="bf16",
+                profiler=ProfilerConfig(enabled=True, wait=2, warmup=1, active=4),
                 gradient_accumulation=GradientAccumulationConfig(steps=4),
                 fsdp=FSDPConfig(
                     reshard_after_forward=False,

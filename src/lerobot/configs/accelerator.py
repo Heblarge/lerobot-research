@@ -247,6 +247,31 @@ class ActivationCheckpointingConfig:
 
 
 @dataclass
+class ProfilerConfig:
+    """Optional PyTorch profiler settings for a short training trace."""
+
+    enabled: bool = False
+    wait: int = 1
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 1
+    record_shapes: bool = True
+    profile_memory: bool = True
+    with_stack: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate profiler schedule lengths."""
+        if self.wait < 0:
+            raise ValueError(f"profiler.wait must be >= 0, got {self.wait}.")
+        if self.warmup < 0:
+            raise ValueError(f"profiler.warmup must be >= 0, got {self.warmup}.")
+        if self.active < 1:
+            raise ValueError(f"profiler.active must be >= 1, got {self.active}.")
+        if self.repeat < 0:
+            raise ValueError(f"profiler.repeat must be >= 0, got {self.repeat}.")
+
+
+@dataclass
 class AcceleratorConfig:
     """Builds the `Accelerator` — the runtime counterpart of the `parallelism` topology.
 
@@ -259,6 +284,8 @@ class AcceleratorConfig:
     """
 
     mixed_precision: str = "no"
+    # 中文标记：新增可选 PyTorch profiler 配置，默认关闭，不影响常规训练。
+    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     gradient_accumulation: GradientAccumulationConfig = field(default_factory=GradientAccumulationConfig)
     grad_scaler: GradScalerConfig = field(default_factory=GradScalerConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)

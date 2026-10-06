@@ -812,6 +812,50 @@ def train(cfg: TrainPipelineConfig) -> None:
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    # 中文标记：按配置采集 CPU 算子、CUDA kernel、tensor shape 和 CPU/CUDA 显存活动。
+    profiler = None
+    if cfg.accelerator.profiler.enabled and step < cfg.steps:
+        profiler_activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            profiler_activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profiler_output_dir = cfg.output_dir / "profiler"
+        remaining_steps = cfg.steps - step
+        profiler_wait = min(cfg.accelerator.profiler.wait, remaining_steps - 1)
+        profiler_warmup = min(cfg.accelerator.profiler.warmup, remaining_steps - profiler_wait - 1)
+        profiler_active = min(
+            cfg.accelerator.profiler.active,
+            remaining_steps - profiler_wait - profiler_warmup,
+        )
+        if is_main_process() and (
+            profiler_wait != cfg.accelerator.profiler.wait
+            or profiler_warmup != cfg.accelerator.profiler.warmup
+            or profiler_active != cfg.accelerator.profiler.active
+        ):
+            logging.warning(
+                "Profiler schedule shortened to fit the remaining %d training steps: "
+                "wait=%d, warmup=%d, active=%d",
+                remaining_steps,
+                profiler_wait,
+                profiler_warmup,
+                profiler_active,
+            )
+        profiler = torch.profiler.profile(
+            activities=profiler_activities,
+            schedule=torch.profiler.schedule(
+                wait=profiler_wait,
+                warmup=profiler_warmup,
+                active=profiler_active,
+                repeat=cfg.accelerator.profiler.repeat,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profiler_output_dir)),
+            record_shapes=cfg.accelerator.profiler.record_shapes,
+            profile_memory=cfg.accelerator.profiler.profile_memory,
+            with_stack=cfg.accelerator.profiler.with_stack,
+        )
+        profiler.start()
+        if is_main_process():
+            logging.info("PyTorch profiler enabled; traces will be written to %s", profiler_output_dir)
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -999,6 +1043,14 @@ def train(cfg: TrainPipelineConfig) -> None:
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+
+        # 中文标记：一个训练 micro-batch 结束后推进 profiler schedule。
+        if profiler is not None:
+            profiler.step()
+
+    # 中文标记：正常训练循环结束后关闭 profiler，确保 trace 文件完成写入。
+    if profiler is not None:
+        profiler.stop()
 
     if is_main_process():
         progbar.close()
