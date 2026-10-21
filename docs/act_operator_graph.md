@@ -145,6 +145,70 @@ token 数：1（latent）+ 1（state）+ 2 × 15 × 20（两路相机特征图�
 
 以上量化方案尚未在该模型上验证，INT8 的掉点需要在真机上评估。
 
+## 8. 训练 trace 与推理算子图的对照
+
+训练 profiler 输出的 trace（`outputs/train/act_blue_so101_profiler_10steps/profiler/*.pt.trace.json`）里有大量 `aten::xxx` 事件，本节说明它们和上面推理算子图的关系。
+
+### 8.1 `aten::` 是什么
+
+ATen 是 PyTorch 底层的 C++ 张量算子库，Python 里每一个 torch 运算最终都会调到一个 `aten::xxx`。trace 里的事件是一层套一层的，例如：
+
+```
+aten::linear                 ← Python 里 nn.Linear 调用的算子
+ ├─ aten::to / _to_copy      ← autocast 把 fp32 权重转成 bf16
+ └─ aten::addmm              ← 实际干活的矩阵乘 (bias + x·Wᵀ)，下面才是 cuBLAS kernel
+```
+
+因此一个算子在 trace 里会展开成好几行。本文算子图对应的是**外层**这一级（`linear`、`conv2d`、`softmax` 等）。
+
+### 8.2 trace 与算子图的条件差异
+
+| | 推理算子图（第 1–7 节） | 训练 trace |
+|---|---|---|
+| 场景 | 推理 | **训练**（前向 + 反向 + AdamW） |
+| 相机 | 2 路（up/side） | 1 路（front） |
+| batch | 1 | 4 |
+| token 数 | 602 | encoder 302 / VAE 102 / decoder 100 |
+| 精度 | FP32 | **BF16 autocast**（`mixed_precision: bf16`） |
+
+trace 记录了 3 个 step（ProfilerStep#2–4）。线程 35530 是前向和优化器，线程 36004 是 autograd 反向线程。
+
+### 8.3 前向算子对应关系
+
+下表按 ProfilerStep#3 的外层 aten 算子统计：
+
+| trace 中的算子 | 次数 | 对应算子图里的什么 | 部署时 |
+|---|---|---|---|
+| `aten::conv2d` → `cudnn_convolution` | 21 | ResNet18 的 20 个 conv，加 1 个 1×1 投影 conv | ✅ 保留 |
+| `aten::rsqrt` / `mul` / `add` / `sub` | 20 / … | FrozenBN 被拆成逐元素运算（20 个 rsqrt 对应 20 个 BN） | 折叠进 conv |
+| `aten::relu_` / `relu` | 26 | CNN 和 FFN 的 ReLU | ✅ 融合 |
+| `aten::max_pool2d` | 1 | ResNet stem | ✅ |
+| `aten::linear` → `addmm` | 64 | Encoder 24、Decoder 10、VAE encoder 24、各种投影 6 | 保留 37 个，VAE 相关的 27 个删掉 |
+| `aten::bmm` | 16 | Encoder 和 Decoder 注意力里的 QKᵀ、Attn·V | ✅ |
+| `aten::baddbmm` | 4 | VAE encoder 注意力（带 key_padding_mask，mask 以加法合进矩阵乘） | ❌ 删除 |
+| `aten::softmax` | 10 | Encoder 4、Decoder 2、VAE 4 | 保留 6 个 |
+| `aten::layer_norm` | 20 | Encoder 8、Decoder 4、VAE 8 | 保留 12 个 |
+| `aten::chunk` / `unbind` / `transpose` / `reshape` / `view` / `cat` / `stack` | 很多 | MHA 拆 Q/K/V、拆多头、拼 token | 布局操作 |
+| `cumsum` / `arange` / `pow` / `div` / `sin` / `cos` | 若干 | 2D 正弦位置编码 | 预计算成常量 |
+| `aten::mean` | 11 | 10 个来自 `nn.MultiheadAttention` 默认 `need_weights=True`，对注意力权重做 head 平均（形状 (4,8,L,L)），但代码用 `[0]` 直接丢弃了结果；第 11 个是 KL loss 的 mean | ❌ 纯浪费，部署时不实现 |
+| `aten::dropout` → `native_dropout` | 38 | 训练时的 Dropout | ❌ 推理时是 no-op |
+| `aten::to` / `_to_copy` | 167 | 图像 uint8→float，以及 autocast 的 fp32↔bf16 转换 | 只剩输入转换和归一化 |
+| `exp` / `pow` / `l1_loss` / `sum` / `masked_fill_` | 少量 | VAE 重参数化、KL loss、L1 loss | ❌ 训练专用 |
+| `aten::item` | 8 | `loss_dict` 里的 `.item()` | ❌ 见 8.5 |
+
+### 8.4 反向与优化器：部署时全都不需要
+
+- **反向线程**：`mm`（Linear 的梯度）、`convolution_backward`、`threshold_backward`（ReLU 的梯度）、`native_dropout_backward`、`native_layer_norm_backward`、`_softmax_backward_data`、`max_pool2d_with_indices_backward`，以及外层的 `autograd::engine::evaluate_function: XxxBackward0`。它们都是 8.3 中前向算子对应的梯度算子。
+- **优化器**：`_foreach_add_` / `_foreach_lerp_` / `_foreach_addcdiv_` / `_foreach_sqrt` 等，是 AdamW 的批量参数更新。
+
+### 8.5 trace 中值得注意的几点
+
+1. **trace 里只有 CPU 事件，没有 GPU kernel 事件**（事件类别只有 `cpu_op`、`fwdbwd` 等，没有 `kernel`）。这里的耗时是 CPU 下发算子的时间，不是 GPU 真实计算时间。要看每个 kernel 的真实耗时，需要在 profiler 的 activities 里加上 `ProfilerActivity.CUDA`。
+2. **`aten::item` 占了前向约 25 ms / 43 ms**。这不是计算，而是 `.item()` 强制 CPU 等待 GPU 同步，把前面 GPU 上排队的工作时间都算到了它头上。
+3. **autocast 的精度选择可直接参考**：conv、linear、bmm 跑的是 BF16，softmax、layer_norm 被 autocast 自动保持在 FP32，与第 7 节"Softmax/LN 保持高精度、Conv/GEMM 降精度"的建议一致。保存下来的 checkpoint 权重仍是 FP32。
+
+**小结**：从训练 trace 中去掉反向、优化器、loss、Dropout、VAE encoder、`need_weights` 的 mean 以及 autocast 产生的 `to`，剩下的前向算子与本文推理算子图一一对应，只是 token 数因单路相机为 302。
+
 ## 附录：算子图导出脚本
 
 ```python
